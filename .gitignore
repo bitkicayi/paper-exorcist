@@ -1,0 +1,17 @@
+# the rectangle machine's leftovers
+*.pdf
+*.zip
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.bmp
+*.tif
+*.tiff
+__pycache__/
+*.py[cod]
+.venv/
+work/
+outputs/
+.DS_Store
+*~
