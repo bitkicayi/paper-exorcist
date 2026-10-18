@@ -11,17 +11,20 @@ fi
 
 exec "$python_bin" - "$@" <<'PYTHON'
 import argparse
+import csv
 import io
 import math
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import warnings
 import zipfile
 
-VERSION = "1.2.0"
+VERSION = "1.3.1"
 IMAGE_FORMATS = {
     ".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP",
     ".bmp": "BMP", ".tif": "TIFF", ".tiff": "TIFF",
@@ -29,7 +32,7 @@ IMAGE_FORMATS = {
 
 
 def load_dependencies():
-    global cv2, np, Image, ImageOps, ImageReader, canvas, A4, LETTER
+    global cv2, np, Image, ImageOps, ImageReader, canvas, A4, LETTER, pdfmetrics, TTFont
     try:
         import cv2
         import numpy as np
@@ -37,6 +40,8 @@ def load_dependencies():
         from reportlab.lib.utils import ImageReader
         from reportlab.pdfgen import canvas
         from reportlab.lib.pagesizes import A4, LETTER
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
     except ImportError as exc:
         raise ValueError(
             f"Eksik Python bağımlılığı: {exc}.\n"
@@ -91,6 +96,18 @@ def arguments():
                         help="ZIP'lerden açılacak toplam resim boyutu sınırı (varsayılan: 1024 MiB)")
     parser.add_argument("--zip-max-files", type=int, default=5000, metavar="SAYI",
                         help="ZIP'lerden açılacak toplam resim sayısı sınırı (varsayılan: 5000)")
+    ocr = parser.add_mutually_exclusive_group()
+    ocr.add_argument("--ocr", dest="ocr", action="store_true", help="Seçilebilir metin ekle (varsayılan)")
+    ocr.add_argument("--no-ocr", dest="ocr", action="store_false", help="OCR yapmadan yalnızca görüntüyü ekle")
+    parser.set_defaults(ocr=True)
+    parser.add_argument("--ocr-lang", default="tur+eng", metavar="DİL",
+                        help="Tesseract dilleri; örnek: tur+eng veya eng (varsayılan: tur+eng)")
+    parser.add_argument("--ocr-psm", type=int, choices=(3, 4, 6, 11), default=3,
+                        help="OCR yerleşimi: 3 otomatik, 4 sütun, 6 metin bloğu, 11 dağınık metin")
+    parser.add_argument("--ocr-preprocess", choices=("scan", "none"), default="scan",
+                        help="OCR için gölge temizliği; PDF görüntüsünü değiştirmez (varsayılan: scan)")
+    parser.add_argument("--ocr-timeout", type=float, default=120, metavar="SANİYE",
+                        help="Sayfa başına OCR süre sınırı (varsayılan: 120 saniye)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     args = parser.parse_args()
     if not math.isfinite(args.min_area) or not 0.01 <= args.min_area < 0.95:
@@ -105,6 +122,10 @@ def arguments():
         parser.error("--zip-max-mb ve --zip-max-files en az 1 olmalı.")
     if not 1 <= args.jpeg_quality <= 100:
         parser.error("--jpeg-quality 1 ile 100 arasında olmalı.")
+    if not re.fullmatch(r"[A-Za-z0-9_]+(?:\+[A-Za-z0-9_]+)*", args.ocr_lang):
+        parser.error("--ocr-lang dil kodları tur+eng biçiminde olmalı.")
+    if not math.isfinite(args.ocr_timeout) or args.ocr_timeout <= 0:
+        parser.error("--ocr-timeout pozitif ve sonlu olmalı.")
     return args
 
 
@@ -503,6 +524,131 @@ def process_page(path, args, label=None):
     return image
 
 
+def prepare_ocr(args):
+    if not args.ocr:
+        return
+    args.tesseract = shutil.which("tesseract")
+    if args.tesseract is None:
+        raise ValueError(
+            "Seçilebilir metin için Tesseract gerekli.\n"
+            "Kurulum: sudo apt install tesseract-ocr tesseract-ocr-tur tesseract-ocr-eng fonts-dejavu-core\n"
+            "Yalnızca görüntü içeren PDF için --no-ocr kullanabilirsiniz."
+        )
+    try:
+        result = subprocess.run([args.tesseract, "--list-langs"], capture_output=True,
+                                text=True, encoding="utf-8", errors="replace", timeout=30)
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("Tesseract dil listesi alınırken zaman aşımı oluştu.") from exc
+    if result.returncode:
+        raise ValueError(f"Tesseract başlatılamadı: {result.stderr.strip()}")
+    available = set(result.stdout.splitlines())
+    missing = set(args.ocr_lang.split("+")) - available
+    if missing:
+        raise ValueError(
+            f"OCR dil paketi eksik: {', '.join(sorted(missing))}.\n"
+            "Türkçe/İngilizce kurulumu: sudo apt install tesseract-ocr-tur tesseract-ocr-eng\n"
+            "Yüklü dilleri görmek için: tesseract --list-langs"
+        )
+    fonts = (
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
+    )
+    font_path = next((path for path in fonts if path.is_file()), None)
+    if font_path is None:
+        raise ValueError("OCR metin fontu bulunamadı. Kurulum: sudo apt install fonts-dejavu-core")
+    args.ocr_font = "PaperExorcistOCR"
+    pdfmetrics.registerFont(TTFont(args.ocr_font, str(font_path)))
+
+
+def recognize_words(image, args, effective_dpi):
+    # Upscale only the recognition input; the PDF's visible image is unchanged.
+    scale = min(2.0, max(1.0, 300 / effective_dpi))
+    size = (max(2, round(image.width * scale)), max(2, round(image.height * scale)))
+    if min(size) < 10:
+        return []
+    with tempfile.TemporaryDirectory(prefix="paper-exorcist-ocr-") as directory:
+        path = Path(directory) / "page.png"
+        # Recognition must not depend on the chosen visible PDF color mode.
+        # Clean shadows before upscaling, just as --mode scan does for the image.
+        recognition = image
+        if args.ocr_preprocess == "scan" and args.mode not in ("scan", "bw"):
+            recognition = Image.fromarray(scan_image(np.asarray(image.convert("RGB"))))
+        try:
+            if size == recognition.size:
+                recognition.save(path, format="PNG")
+            else:
+                with recognition.resize(size, getattr(Image, "Resampling", Image).LANCZOS) as enlarged:
+                    enlarged.save(path, format="PNG")
+        finally:
+            if recognition is not image:
+                recognition.close()
+        command = [args.tesseract, str(path), "stdout", "-l", args.ocr_lang,
+                   "--psm", str(args.ocr_psm), "--dpi",
+                   str(max(70, min(2400, round(effective_dpi * scale)))),
+                   "-c", "tessedit_create_tsv=1"]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=args.ocr_timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError("OCR zaman aşımı: --ocr-timeout ile süreyi artırabilirsiniz.") from exc
+    if result.returncode:
+        raise ValueError(f"Tesseract OCR başarısız: {result.stderr.strip()}")
+    reader = csv.DictReader(io.StringIO(result.stdout), delimiter="\t", quoting=csv.QUOTE_NONE)
+    required = {"level", "page_num", "block_num", "par_num", "line_num",
+                "left", "top", "width", "height", "text"}
+    if not required.issubset(reader.fieldnames or ()):
+        raise ValueError("Tesseract geçerli TSV metin verisi döndürmedi.")
+    words = []
+    for row in reader:
+        if row.get("level") != "5":
+            continue
+        text = re.sub(r"\s+", " ", (row.get("text") or "").replace("\x00", "")).strip()
+        if not text:
+            continue
+        try:
+            left, top, width, height = (int(row[key]) for key in ("left", "top", "width", "height"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Tesseract geçersiz sözcük koordinatları döndürdü.") from exc
+        if min(left, top) < 0 or min(width, height) <= 0:
+            continue
+        right, bottom = min(size[0], left + width), min(size[1], top + height)
+        if right <= left or bottom <= top:
+            continue
+        # Normalize boxes so resizing, crop, rotation, A4 fitting and margins
+        # all share the same mapping into the final page coordinates.
+        line = tuple(row[key] for key in ("page_num", "block_num", "par_num", "line_num"))
+        words.append((text, left / size[0], top / size[1],
+                      (right - left) / size[0], (bottom - top) / size[1], line))
+    return words
+
+
+def draw_ocr_layer(pdf, words, args, origin_x, origin_y, image_width, image_height):
+    ascent, descent = pdfmetrics.getAscentDescent(args.ocr_font)
+    lines = {}
+    for word in words:
+        lines.setdefault(word[5], []).append(word)
+    for line in lines.values():
+        # Glyph boxes have different heights (capitals, descenders, punctuation).
+        # A shared baseline prevents PDF readers from reordering one sentence
+        # into several rows when copying text from a slightly curved book page.
+        line_height = float(np.median([word[4] for word in line])) * image_height
+        font_size = max(1.0, line_height * 1000 / (ascent - descent))
+        bottom = float(np.median([word[2] + word[4] for word in line]))
+        baseline = origin_y + image_height * (1 - bottom) - descent * font_size / 1000
+        text = pdf.beginText()
+        text.setFont(args.ocr_font, font_size)
+        text.setTextRenderMode(3)  # Invisible glyphs remain searchable/selectable.
+        for word, left, top, width, height, _ in line:
+            text_width = pdfmetrics.stringWidth(word, args.ocr_font, font_size)
+            if text_width <= 0:
+                continue
+            text.setTextOrigin(origin_x + left * image_width, baseline)
+            text.setHorizScale(100 * width * image_width / text_width)
+            text.textOut(word + " ")
+        pdf.drawText(text)
+
+
 def draw_page(pdf, image, args):
     margin = args.margin_mm * 72 / 25.4
     if args.paper == "image":
@@ -528,8 +674,16 @@ def draw_page(pdf, image, args):
         reader = ImageReader(buffer)
     else:
         reader = ImageReader(image)
-    pdf.drawImage(reader, (page_w - width) / 2, (page_h - height) / 2,
+    origin_x, origin_y = (page_w - width) / 2, (page_h - height) / 2
+    pdf.drawImage(reader, origin_x, origin_y,
                   width=width, height=height)
+    if args.ocr:
+        words = recognize_words(image, args, 72 / factor)
+        draw_ocr_layer(pdf, words, args, origin_x, origin_y, width, height)
+        if words:
+            print(f"OCR: {len(words)} sözcük; {args.ocr_lang}", file=sys.stderr)
+        else:
+            print("Uyarı: Bu sayfada OCR ile okunabilir metin bulunamadı.", file=sys.stderr)
     pdf.showPage()
 
 
@@ -588,6 +742,7 @@ def main():
     args = arguments()
     try:
         load_dependencies()
+        prepare_ocr(args)
         create_pdf(args)
     except KeyboardInterrupt:
         print("\nİşlem iptal edildi.", file=sys.stderr)
