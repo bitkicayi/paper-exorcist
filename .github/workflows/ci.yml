@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  exorcise:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: summon the dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3-opencv python3-pil python3-reportlab python3-pyflakes \
+            tesseract-ocr tesseract-ocr-osd tesseract-ocr-tur tesseract-ocr-eng \
+            fonts-dejavu-core poppler-utils libheif-examples shellcheck
+      - name: lint
+        run: make lint
+      - name: test
+        run: make test

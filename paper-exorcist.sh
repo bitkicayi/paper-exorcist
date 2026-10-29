@@ -11,9 +11,13 @@ fi
 
 exec "$python_bin" - "$@" <<'PYTHON'
 import argparse
+import collections
+import concurrent.futures
+import contextlib
 import csv
 import io
 import math
+import multiprocessing
 import os
 from pathlib import Path
 import re
@@ -24,11 +28,16 @@ import tempfile
 import warnings
 import zipfile
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 IMAGE_FORMATS = {
     ".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP",
     ".bmp": "BMP", ".tif": "TIFF", ".tiff": "TIFF",
 }
+# iPhone photos arrive as HEIC; heif-convert (libheif-examples) decodes them.
+HEIF_SUFFIXES = {".heic", ".heif"}
+PAGE_SUFFIXES = set(IMAGE_FORMATS) | HEIF_SUFFIXES
+# Exit status when --keep-going skipped pages but still produced a PDF.
+EXIT_PARTIAL = 2
 
 
 def load_dependencies():
@@ -63,6 +72,12 @@ def crop_argument(value):
         )
 
 
+def default_jobs():
+    # Tesseract already uses a few threads per page; more than four
+    # processes mostly trades memory for little extra speed.
+    return max(1, min(4, os.cpu_count() or 1))
+
+
 def arguments():
     parser = argparse.ArgumentParser(
         prog="paper-exorcist",
@@ -73,6 +88,12 @@ def arguments():
     parser.add_argument("-o", "--output", required=True, metavar="PDF", help="Çıktı PDF yolu")
     parser.add_argument("-r", "--recursive", action="store_true", help="Klasörlerin altına da bak")
     parser.add_argument("-f", "--force", action="store_true", help="Mevcut PDF'in üzerine yaz")
+    parser.add_argument("-j", "--jobs", type=int, default=default_jobs(), metavar="SAYI",
+                        help="Aynı anda işlenecek sayfa sayısı (varsayılan: çekirdek sayısı, en fazla 4)")
+    parser.add_argument("-k", "--keep-going", action="store_true",
+                        help="İşlenemeyen sayfaları atla; PDF'i kalan sayfalarla oluştur (çıkış kodu 2)")
+    parser.add_argument("--debug-dir", metavar="KLASÖR",
+                        help="Algılanan köşeleri ve son sayfa görüntüsünü bu klasöre kaydet")
     crop = parser.add_mutually_exclusive_group()
     crop.add_argument("--crop", type=crop_argument, metavar="X,Y,W,H", help="Piksel cinsinden elle kırp")
     crop.add_argument("--no-auto-crop", action="store_true", help="Görüntünün tamamını kullan")
@@ -82,11 +103,11 @@ def arguments():
     parser.add_argument("--mode", choices=("color", "gray", "bw", "scan"), default="color",
                         help="Renkli, gri, siyah-beyaz veya gölge azaltılmış tarama (varsayılan: color)")
     parser.add_argument("--compression", choices=("auto", "lossless", "jpeg"), default="auto",
-                        help="PDF resim sıkıştırması; auto: JPEG kaynakları yeniden sıkıştır (varsayılan: auto)")
+                        help="PDF resim sıkıştırması; auto: JPEG/HEIC kaynakları yeniden sıkıştır (varsayılan: auto)")
     parser.add_argument("--jpeg-quality", type=int, default=92, metavar="1-100",
                         help="JPEG sıkıştırma kalitesi (varsayılan: 92)")
-    parser.add_argument("--rotate", type=int, choices=(0, 90, 180, 270), default=0,
-                        help="Kırpmadan sonra saat yönünde döndür")
+    parser.add_argument("--rotate", choices=("0", "90", "180", "270", "auto"), default="0",
+                        help="Kırpmadan sonra saat yönünde döndür; auto: Tesseract yönü tahmin eder")
     parser.add_argument("--paper", choices=("a4", "letter", "image"), default="a4",
                         help="Sayfa boyutu; image: görüntü/DPI (varsayılan: a4)")
     parser.add_argument("--dpi", type=int, default=300, help="image modunun DPI değeri (varsayılan: 300)")
@@ -122,6 +143,8 @@ def arguments():
         parser.error("--zip-max-mb ve --zip-max-files en az 1 olmalı.")
     if not 1 <= args.jpeg_quality <= 100:
         parser.error("--jpeg-quality 1 ile 100 arasında olmalı.")
+    if not 1 <= args.jobs <= 64:
+        parser.error("--jobs 1 ile 64 arasında olmalı.")
     if not re.fullmatch(r"[A-Za-z0-9_]+(?:\+[A-Za-z0-9_]+)*", args.ocr_lang):
         parser.error("--ocr-lang dil kodları tur+eng biçiminde olmalı.")
     if not math.isfinite(args.ocr_timeout) or args.ocr_timeout <= 0:
@@ -140,7 +163,7 @@ def natural_key(path):
 
 def collect_inputs(inputs, recursive):
     files, seen = [], set()
-    supported = set(IMAGE_FORMATS) | {".zip"}
+    supported = PAGE_SUFFIXES | {".zip"}
     for name in inputs:
         path = Path(name).expanduser()
         if path.is_dir():
@@ -178,7 +201,7 @@ def expand_archives(files, directory, args):
                     normalized = info.filename.replace("\\", "/")
                     parts = normalized.split("/")
                     suffix = Path(parts[-1]).suffix.lower()
-                    if (not info.is_dir() and suffix in IMAGE_FORMATS
+                    if (not info.is_dir() and suffix in PAGE_SUFFIXES
                             and "__MACOSX" not in parts and not parts[-1].startswith("._")):
                         members.append(info)
                 members.sort(key=lambda info: natural_key(info.filename.replace("\\", "/")))
@@ -239,6 +262,27 @@ def read_rgb(path, label=None):
             return np.frombuffer(rgb_image.tobytes(), dtype=np.uint8).reshape(
                 rgb_image.height, rgb_image.width, 3
             ).copy()
+
+
+def read_heif(path, label, args, messages):
+    with tempfile.TemporaryDirectory(prefix="paper-exorcist-heif-") as directory:
+        try:
+            result = subprocess.run([args.heif_convert, str(path), str(Path(directory) / "page.png")],
+                                    capture_output=True, text=True, encoding="utf-8",
+                                    errors="replace", timeout=args.ocr_timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError("HEIC dönüştürme zaman aşımı.") from exc
+        if result.returncode:
+            raise ValueError(f"HEIC dönüştürülemedi: {(result.stderr or result.stdout).strip()}")
+        # heif-convert also writes auxiliary images such as page-depth.png for
+        # portrait photos; only top-level images (page.png, page-N.png) are pages.
+        images = sorted((p for p in Path(directory).iterdir()
+                         if re.fullmatch(r"page(?:-\d+)?\.png", p.name)), key=natural_key)
+        if not images:
+            raise ValueError("HEIC dönüştürücü resim üretmedi.")
+        if len(images) > 1:
+            messages.append(f"Uyarı: HEIC içinde {len(images)} resim var; yalnızca ilki kullanılıyor.")
+        return read_rgb(images[0], label)
 
 
 def order_corners(points):
@@ -481,29 +525,102 @@ def scan_image(rgb):
     return np.clip((normalized.astype(np.float32) - black) * 255 / (248 - black), 0, 255).astype(np.uint8)
 
 
-def process_page(path, args, label=None):
-    label = str(path) if label is None else label
-    rgb = read_rgb(path, label)
+def detect_rotation(rgb, args):
+    """Ask Tesseract OSD how far the page must turn clockwise to stand upright."""
+    gray = scan_image(rgb)
+    scale = min(1.0, 2000 / max(gray.shape))
+    if scale < 1:
+        gray = cv2.resize(gray, (max(2, round(gray.shape[1] * scale)), max(2, round(gray.shape[0] * scale))),
+                          interpolation=cv2.INTER_AREA)
+    with tempfile.TemporaryDirectory(prefix="paper-exorcist-osd-") as directory:
+        path = Path(directory) / "page.png"
+        Image.fromarray(gray).save(path, format="PNG")
+        try:
+            result = subprocess.run([args.tesseract, str(path), "stdout", "--psm", "0", "--dpi", "300"],
+                                    capture_output=True, text=True, encoding="utf-8",
+                                    errors="replace", timeout=args.ocr_timeout)
+        except subprocess.TimeoutExpired:
+            return 0, None
+    rotate = re.search(r"^Rotate:\s*(\d+)", result.stdout, re.M)
+    confidence = re.search(r"^Orientation confidence:\s*([\d.]+)", result.stdout, re.M)
+    # OSD exits non-zero on pages with too few characters; treat as upright.
+    if result.returncode or not rotate or not confidence:
+        return 0, None
+    return int(rotate.group(1)) % 360, float(confidence.group(1))
+
+
+def debug_name(index, label):
+    stem = re.sub(r"[^\w.-]+", "_", Path(label.split("!")[-1]).stem).strip("._")[:60]
+    return f"{index + 1:04d}-{stem or 'page'}"
+
+
+def save_debug(index, label, rgb, corners, note, image, args):
+    directory = Path(args.debug_dir)
+    name = debug_name(index, label)
+    scale = min(1.0, 1600 / max(rgb.shape[:2]))
+    preview = rgb.copy() if scale == 1 else cv2.resize(
+        rgb, (max(2, round(rgb.shape[1] * scale)), max(2, round(rgb.shape[0] * scale))),
+        interpolation=cv2.INTER_AREA)
+    thickness = max(2, round(max(preview.shape[:2]) / 300))
+    if corners is not None:
+        points = np.rint(corners * scale).astype(np.int32)
+        cv2.polylines(preview, [points], True, (0, 220, 0), thickness)
+        for point in points:
+            cv2.circle(preview, (int(point[0]), int(point[1])), thickness * 3, (230, 0, 0), -1)
+    if note:
+        cv2.putText(preview, note, (20, 20 + 20 * thickness), cv2.FONT_HERSHEY_SIMPLEX,
+                    thickness / 2, (230, 0, 0), thickness)
+    Image.fromarray(preview).save(directory / f"{name}-detect.jpg", quality=85)
+    page = image.convert("L") if image.mode == "1" else image
+    page.save(directory / f"{name}-page.jpg", quality=85)
+    return directory / f"{name}-detect.jpg"
+
+
+def process_page(index, path, label, args, messages):
+    if path.suffix.lower() in HEIF_SUFFIXES:
+        rgb = read_heif(path, label, args, messages)
+    else:
+        rgb = read_rgb(path, label)
+    source = rgb
     original_h, original_w = rgb.shape[:2]
     status = "tam görüntü"
+    corners, note = None, "auto crop off"
     if args.crop:
         x, y, width, height = args.crop
         if x + width > original_w or y + height > original_h:
             raise ValueError(f"Kırpma görüntü sınırlarını aşıyor: {label} ({original_w}x{original_h})")
         rgb = rgb[y:y + height, x:x + width].copy()
-        status = "elle kırpıldı"
+        corners = np.float32([[x, y], [x + width, y], [x + width, y + height], [x, y + height]])
+        status, note = "elle kırpıldı", None
     elif not args.no_auto_crop:
         corners = detect_document(rgb, args.min_area)
         if corners is None:
-            message = f"Belge sınırı algılanamadı: {label}"
+            message = "Belge sınırı algılanamadı"
             if args.strict:
                 raise ValueError(message)
-            print(f"Uyarı: {message}; tam görüntü kullanılıyor.", file=sys.stderr)
+            messages.append(f"Uyarı: {message}; tam görüntü kullanılıyor.")
+            note = "no document found"
         else:
             rgb = warp_document(rgb, corners)
-            status = "belge kırpıldı / perspektif düzeltildi"
-    if args.rotate:
-        rgb = np.ascontiguousarray(np.rot90(rgb, -(args.rotate // 90)))
+            status, note = "belge kırpıldı / perspektif düzeltildi", None
+            if args.debug_dir:
+                x, y = (int(v) for v in np.floor(corners.min(axis=0)))
+                right, bottom = (int(v) for v in np.ceil(corners.max(axis=0)))
+                messages.append(f"Köşeler: {', '.join(f'{px:.0f},{py:.0f}' for px, py in corners)}; "
+                                f"--crop önerisi: {x},{y},{right - x},{bottom - y}")
+    if args.rotate == "auto":
+        rotate, confidence = detect_rotation(rgb, args)
+        if confidence is None:
+            messages.append("Yön: metin az, olduğu gibi bırakıldı.")
+        elif rotate and confidence < 1.5:
+            messages.append(f"Yön: {rotate}° önerildi ama güven düşük ({confidence:.1f}); döndürülmedi.")
+            rotate = 0
+        elif rotate:
+            messages.append(f"Yön: {rotate}° döndürüldü (güven {confidence:.1f}).")
+    else:
+        rotate = int(args.rotate)
+    if rotate:
+        rgb = np.ascontiguousarray(np.rot90(rgb, -(rotate // 90)))
     if args.mode in ("gray", "bw", "scan"):
         gray = scan_image(rgb) if args.mode == "scan" else cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         if args.mode == "bw":
@@ -519,18 +636,24 @@ def process_page(path, args, label=None):
             image = image.convert("1", dither=Image.NONE)
     else:
         image = Image.fromarray(rgb)
-    image.info["source_format"] = IMAGE_FORMATS[path.suffix.lower()]
-    print(f"{label}: {original_w}x{original_h} -> {image.width}x{image.height}; {status}", file=sys.stderr)
+    if args.debug_dir:
+        messages.append(f"Hata ayıklama: {save_debug(index, label, source, corners, note, image, args)}")
+    messages.insert(0, f"{original_w}x{original_h} -> {image.width}x{image.height}; {status}")
     return image
 
 
-def prepare_ocr(args):
-    if not args.ocr:
+def prepare_tools(args):
+    args.heif_convert = shutil.which("heif-convert")
+    args.tesseract = None
+    languages = set(args.ocr_lang.split("+")) if args.ocr else set()
+    if args.rotate == "auto":
+        languages.add("osd")
+    if not languages:
         return
     args.tesseract = shutil.which("tesseract")
     if args.tesseract is None:
         raise ValueError(
-            "Seçilebilir metin için Tesseract gerekli.\n"
+            "Seçilebilir metin ve --rotate auto için Tesseract gerekli.\n"
             "Kurulum: sudo apt install tesseract-ocr tesseract-ocr-tur tesseract-ocr-eng fonts-dejavu-core\n"
             "Yalnızca görüntü içeren PDF için --no-ocr kullanabilirsiniz."
         )
@@ -542,13 +665,15 @@ def prepare_ocr(args):
     if result.returncode:
         raise ValueError(f"Tesseract başlatılamadı: {result.stderr.strip()}")
     available = set(result.stdout.splitlines())
-    missing = set(args.ocr_lang.split("+")) - available
+    missing = languages - available
     if missing:
         raise ValueError(
             f"OCR dil paketi eksik: {', '.join(sorted(missing))}.\n"
             "Türkçe/İngilizce kurulumu: sudo apt install tesseract-ocr-tur tesseract-ocr-eng\n"
             "Yüklü dilleri görmek için: tesseract --list-langs"
         )
+    if not args.ocr:
+        return
     fonts = (
         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
         Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"),
@@ -649,7 +774,7 @@ def draw_ocr_layer(pdf, words, args, origin_x, origin_y, image_width, image_heig
         pdf.drawText(text)
 
 
-def draw_page(pdf, image, args):
+def page_layout(image, args):
     margin = args.margin_mm * 72 / 25.4
     if args.paper == "image":
         page_w = image.width * 72 / args.dpi + 2 * margin
@@ -663,10 +788,36 @@ def draw_page(pdf, image, args):
         raise ValueError("Kenar boşluğu sayfa için fazla büyük.")
     factor = min(content_w / image.width, content_h / image.height)
     width, height = image.width * factor, image.height * factor
+    # Page size, image box (x, y, width, height) and the effective DPI for OCR.
+    return (page_w, page_h), ((page_w - width) / 2, (page_h - height) / 2, width, height), 72 / factor
+
+
+def render_page(index, path, label, args):
+    """Everything per page except PDF drawing; safe to run in a worker process."""
+    messages = []
+    try:
+        image = process_page(index, path, label, args, messages)
+        try:
+            layout = page_layout(image, args)
+            words = None
+            if args.ocr:
+                words = recognize_words(image, args, layout[2])
+                messages.append(f"OCR: {len(words)} sözcük; {args.ocr_lang}" if words
+                                else "Uyarı: Bu sayfada OCR ile okunabilir metin bulunamadı.")
+        except BaseException:
+            image.close()
+            raise
+    except Exception as exc:
+        # OpenCV/Pillow errors may not survive pickling back to the parent.
+        raise ValueError(str(exc) or type(exc).__name__) from None
+    source_format = "JPEG" if path.suffix.lower() in HEIF_SUFFIXES else IMAGE_FORMATS[path.suffix.lower()]
+    return image, words, layout, source_format, messages
+
+
+def draw_page(pdf, image, words, layout, source_format, args):
+    (page_w, page_h), (origin_x, origin_y, width, height), _ = layout
     pdf.setPageSize((page_w, page_h))
-    use_jpeg = args.compression == "jpeg" or (
-        args.compression == "auto" and image.info.get("source_format") == "JPEG"
-    )
+    use_jpeg = args.compression == "jpeg" or (args.compression == "auto" and source_format == "JPEG")
     if use_jpeg and image.mode != "1":
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=args.jpeg_quality, optimize=True)
@@ -674,17 +825,51 @@ def draw_page(pdf, image, args):
         reader = ImageReader(buffer)
     else:
         reader = ImageReader(image)
-    origin_x, origin_y = (page_w - width) / 2, (page_h - height) / 2
-    pdf.drawImage(reader, origin_x, origin_y,
-                  width=width, height=height)
-    if args.ocr:
-        words = recognize_words(image, args, 72 / factor)
+    pdf.drawImage(reader, origin_x, origin_y, width=width, height=height)
+    if words:
         draw_ocr_layer(pdf, words, args, origin_x, origin_y, width, height)
-        if words:
-            print(f"OCR: {len(words)} sözcük; {args.ocr_lang}", file=sys.stderr)
-        else:
-            print("Uyarı: Bu sayfada OCR ile okunabilir metin bulunamadı.", file=sys.stderr)
     pdf.showPage()
+
+
+def worker_init():
+    # Each worker handles one page; nested thread pools only oversubscribe.
+    cv2.setNumThreads(1)
+    os.environ["OMP_THREAD_LIMIT"] = "1"
+
+
+def rendered_pages(pages, args):
+    """Yield (page, result or exception) in input order, rendering ahead in parallel."""
+    if args.jobs == 1 or len(pages) == 1:
+        for index, (path, label) in enumerate(pages):
+            try:
+                yield (path, label), render_page(index, path, label, args)
+            except Exception as exc:
+                yield (path, label), exc
+        return
+    # The engine runs from stdin, so workers must be forked rather than spawned.
+    context = multiprocessing.get_context("fork")
+    pool = concurrent.futures.ProcessPoolExecutor(min(args.jobs, len(pages)), mp_context=context,
+                                                  initializer=worker_init)
+    try:
+        queue = collections.deque()
+        upcoming = iter(enumerate(pages))
+        # A bounded window keeps memory flat for archives with thousands of photos.
+        for index, (path, label) in upcoming:
+            queue.append(((path, label), pool.submit(render_page, index, path, label, args)))
+            if len(queue) >= args.jobs * 2:
+                break
+        while queue:
+            page, future = queue.popleft()
+            try:
+                outcome = future.result()
+            except Exception as exc:
+                outcome = exc
+            for index, (path, label) in upcoming:
+                queue.append(((path, label), pool.submit(render_page, index, path, label, args)))
+                break
+            yield page, outcome
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def create_pdf(args):
@@ -702,25 +887,49 @@ def create_pdf(args):
     for path in files:
         if path.resolve() == resolved_output or (output.exists() and os.path.samefile(path, output)):
             raise ValueError("Çıktı bir girdi dosyasıyla aynı olamaz.")
+    if args.debug_dir:
+        args.debug_dir = str(Path(args.debug_dir).expanduser().absolute())
+        Path(args.debug_dir).mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="paper-exorcist-zip-") as directory:
         pages = expand_archives(files, Path(directory), args)
-        write_pdf(pages, output, args)
+        if args.heif_convert is None and any(p.suffix.lower() in HEIF_SUFFIXES for p, _ in pages):
+            raise ValueError("HEIC/HEIF resimleri için heif-convert gerekli.\n"
+                             "Kurulum: sudo apt install libheif-examples")
+        return write_pdf(pages, output, args)
 
 
 def write_pdf(pages, output, args):
     # Build alongside the destination, then publish only the finished PDF.
     fd, temporary = tempfile.mkstemp(prefix=".paper-exorcist-", suffix=".pdf", dir=output.parent)
     os.close(fd)
+    # mkstemp creates 0600; give the result the permissions a normal file would get.
+    umask = os.umask(0)
+    os.umask(umask)
+    os.chmod(temporary, 0o666 & ~umask)
+    skipped = []
     try:
         pdf = canvas.Canvas(temporary, pagesize=A4, pageCompression=1)
         pdf.setTitle(output.stem)
         pdf.setCreator(f"paper-exorcist {VERSION}")
-        for path, label in pages:
-            try:
-                with process_page(path, args, label) as image:
-                    draw_page(pdf, image, args)
-            except Exception as exc:
-                raise ValueError(f"İşlenemedi: {label}: {exc}") from exc
+        total = len(pages)
+        # closing() stops the worker pool promptly when a page aborts the run.
+        with contextlib.closing(rendered_pages(pages, args)) as results:
+            for number, ((path, label), outcome) in enumerate(results, 1):
+                prefix = f"[{number}/{total}]"
+                if isinstance(outcome, Exception):
+                    if not args.keep_going:
+                        raise ValueError(f"İşlenemedi: {label}: {outcome}")
+                    print(f"{prefix} Atlandı: {label}: {outcome}", file=sys.stderr)
+                    skipped.append(label)
+                    continue
+                image, words, layout, source_format, messages = outcome
+                print(f"{prefix} {label}: {messages[0]}", file=sys.stderr)
+                for message in messages[1:]:
+                    print(f"    {message}", file=sys.stderr)
+                with image:
+                    draw_page(pdf, image, words, layout, source_format, args)
+        if len(skipped) == total:
+            raise ValueError("Hiçbir sayfa işlenemedi; PDF oluşturulmadı.")
         pdf.save()
         if args.force:
             os.replace(temporary, output)
@@ -730,7 +939,11 @@ def write_pdf(pages, output, args):
                 os.link(temporary, output)
             except FileExistsError as exc:
                 raise ValueError(f"Çıktı işlem sırasında oluşturuldu: {output}") from exc
-        print(f"Hazır: {output} ({len(pages)} sayfa)")
+        print(f"Hazır: {output} ({total - len(skipped)} sayfa)")
+        if skipped:
+            print(f"Uyarı: {len(skipped)} sayfa atlandı: {', '.join(skipped)}", file=sys.stderr)
+            return EXIT_PARTIAL
+        return 0
     finally:
         try:
             os.unlink(temporary)
@@ -742,15 +955,14 @@ def main():
     args = arguments()
     try:
         load_dependencies()
-        prepare_ocr(args)
-        create_pdf(args)
+        prepare_tools(args)
+        return create_pdf(args)
     except KeyboardInterrupt:
         print("\nİşlem iptal edildi.", file=sys.stderr)
         return 130
     except Exception as exc:
         print(f"Hata: {exc}", file=sys.stderr)
         return 1
-    return 0
 
 
 if __name__ == "__main__":
