@@ -28,7 +28,7 @@ import tempfile
 import warnings
 import zipfile
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 IMAGE_FORMATS = {
     ".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP",
     ".bmp": "BMP", ".tif": "TIFF", ".tiff": "TIFF",
@@ -85,7 +85,8 @@ def arguments():
         epilog="Örnek: paper-exorcist -o belgeler.pdf taramalar.zip sayfa1.png",
     )
     parser.add_argument("inputs", nargs="+", metavar="RESİM_ZIP_KLASÖR")
-    parser.add_argument("-o", "--output", required=True, metavar="PDF", help="Çıktı PDF yolu")
+    parser.add_argument("-o", "--output", metavar="PDF",
+                        help="Çıktı PDF yolu; tek girdide varsayılan: bu klasörde GİRDİ_ADI.pdf")
     parser.add_argument("-r", "--recursive", action="store_true", help="Klasörlerin altına da bak")
     parser.add_argument("-f", "--force", action="store_true", help="Mevcut PDF'in üzerine yaz")
     parser.add_argument("-j", "--jobs", type=int, default=default_jobs(), metavar="SAYI",
@@ -670,6 +671,7 @@ def prepare_tools(args):
         raise ValueError(
             f"OCR dil paketi eksik: {', '.join(sorted(missing))}.\n"
             "Türkçe/İngilizce kurulumu: sudo apt install tesseract-ocr-tur tesseract-ocr-eng\n"
+            "--rotate auto için: sudo apt install tesseract-ocr-osd\n"
             "Yüklü dilleri görmek için: tesseract --list-langs"
         )
     if not args.ocr:
@@ -872,9 +874,20 @@ def rendered_pages(pages, args):
         pool.shutdown(wait=True, cancel_futures=True)
 
 
+def default_output(inputs):
+    if len(inputs) != 1:
+        raise ValueError("Birden fazla girdi için -o ile çıktı PDF yolu verin.")
+    # abspath also gives '.' and '..' a real name.
+    path = Path(os.path.abspath(Path(inputs[0]).expanduser()))
+    name = path.name if path.is_dir() else path.stem
+    if not name:
+        raise ValueError("Çıktı adı türetilemedi; -o ile çıktı PDF yolu verin.")
+    return f"{name}.pdf"
+
+
 def create_pdf(args):
     files = collect_inputs(args.inputs, args.recursive)
-    output = Path(args.output).expanduser().absolute()
+    output = Path(args.output or default_output(args.inputs)).expanduser().absolute()
     if output.suffix.lower() != ".pdf":
         raise ValueError("Çıktı dosyasının uzantısı .pdf olmalı.")
     if not output.parent.is_dir():
@@ -905,7 +918,9 @@ def write_pdf(pages, output, args):
     # mkstemp creates 0600; give the result the permissions a normal file would get.
     umask = os.umask(0)
     os.umask(umask)
-    os.chmod(temporary, 0o666 & ~umask)
+    # FAT/exFAT and some network mounts refuse chmod; the mount decides there.
+    with contextlib.suppress(OSError):
+        os.chmod(temporary, 0o666 & ~umask)
     skipped = []
     try:
         pdf = canvas.Canvas(temporary, pagesize=A4, pageCompression=1)
@@ -939,6 +954,13 @@ def write_pdf(pages, output, args):
                 os.link(temporary, output)
             except FileExistsError as exc:
                 raise ValueError(f"Çıktı işlem sırasında oluşturuldu: {output}") from exc
+            except OSError:
+                # FAT/exFAT USB sticks have no hard links: reserve the name, then replace.
+                try:
+                    os.close(os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
+                except FileExistsError as exc:
+                    raise ValueError(f"Çıktı işlem sırasında oluşturuldu: {output}") from exc
+                os.replace(temporary, output)
         print(f"Hazır: {output} ({total - len(skipped)} sayfa)")
         if skipped:
             print(f"Uyarı: {len(skipped)} sayfa atlandı: {', '.join(skipped)}", file=sys.stderr)

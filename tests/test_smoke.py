@@ -76,6 +76,41 @@ class PaperExorcistTest(unittest.TestCase):
         self.assertIn("--force", result.stderr)
         self.run_script("--no-ocr", "-f", "-o", output, self.photo)
 
+    def test_output_name_defaults_to_the_single_input(self):
+        result = self.run_script("--no-ocr", self.photo)
+        self.assertIn("photo.pdf", result.stdout)
+        self.assertEqual(page_count(self.work / "photo.pdf"), 1)
+        folder = self.work / "scans.v2"
+        folder.mkdir()
+        shutil.copy(self.photo, folder)
+        self.run_script("--no-ocr", folder)
+        self.assertEqual(page_count(self.work / "scans.v2.pdf"), 1)
+        result = self.run_script("--no-ocr", self.photo, self.photo, expect=1)
+        self.assertIn("-o", result.stderr)
+
+    def test_filesystem_without_hard_links_or_chmod(self):
+        # What a FAT/exFAT USB stick does to the final publish step.
+        source = SCRIPT.read_text(encoding="utf-8")
+        engine = source.split("<<'PYTHON'\n", 1)[1].rsplit("PYTHON", 1)[0]
+        harness = self.work / "harness.py"
+        harness.write_text(textwrap.dedent("""\
+            import os, sys
+            def refuse(*args, **kwargs):
+                raise PermissionError(1, "Operation not permitted")
+            os.link = os.chmod = refuse
+            engine = open(sys.argv[1], encoding="utf-8").read()
+            sys.argv = ["paper-exorcist"] + sys.argv[2:]
+            exec(compile(engine, "engine", "exec"), {"__name__": "__main__"})
+        """))
+        engine_path = self.work / "engine.py"
+        engine_path.write_text(engine, encoding="utf-8")
+        output = self.work / "usb.pdf"
+        command = [sys.executable, str(harness), str(engine_path), "--no-ocr", "-o", str(output), str(self.photo)]
+        result = subprocess.run(command, capture_output=True, text=True, cwd=self.work)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(page_count(output), 1)
+        self.assertEqual([p.name for p in self.work.glob(".paper-exorcist-*")], [])
+
     def test_no_ocr_works_without_tesseract(self):
         env = dict(os.environ, PATH="/nonexistent")
         self.run_script("--no-ocr", "-o", self.work / "out.pdf", self.photo, env=env)

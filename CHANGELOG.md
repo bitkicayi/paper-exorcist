@@ -2,6 +2,12 @@
 
 the rectangle's medical history.
 
+## 1.4.1
+
+- `-o` is optional for a single input: `photo.jpg` becomes `photo.pdf` right here.
+- fixed: fat/exfat usb sticks have no hard links, so the finished pdf died on the doorstep.
+- a missing `osd` language pack now tells you what to install.
+
 ## 1.4.0
 
 - heic/heif photos work through `heif-convert`; iphone depth maps are politely ignored.

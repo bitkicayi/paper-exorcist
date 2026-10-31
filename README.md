@@ -28,7 +28,10 @@ make install
 ## feed it rectangles
 
 ```bash
-# one photo, one pdf
+# one photo, one pdf. it even names the child: photo.pdf
+paper-exorcist photo.png
+
+# or choose the name yourself
 paper-exorcist -o document.pdf photo.png
 
 # phone photos with shadow-related emotional baggage
