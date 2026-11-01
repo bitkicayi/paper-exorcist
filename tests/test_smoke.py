@@ -76,6 +76,49 @@ class PaperExorcistTest(unittest.TestCase):
         self.assertIn("--force", result.stderr)
         self.run_script("--no-ocr", "-f", "-o", output, self.photo)
 
+    def test_strict_and_keep_going_cannot_be_combined(self):
+        result = self.run_script("--no-ocr", "--strict", "-k", "-o", self.work / "out.pdf", self.photo, expect=2)
+        self.assertIn("--strict", result.stderr)
+        self.assertFalse((self.work / "out.pdf").exists())
+
+    def test_keep_going_survives_damaged_archives(self):
+        junk = self.work / "junk.zip"
+        junk.write_bytes(b"not a zip at all")
+        output = self.work / "junk.pdf"
+        self.run_script("--no-ocr", "-o", output, junk, self.photo, expect=1)
+        result = self.run_script("--no-ocr", "-k", "-o", output, junk, self.photo, expect=2)
+        self.assertIn("Atlandı", result.stderr)
+        self.assertEqual(page_count(output), 1)
+        # Only the damaged member is lost, not its healthy neighbour.
+        damaged = self.work / "damaged.zip"
+        with zipfile.ZipFile(damaged, "w", zipfile.ZIP_STORED) as zf:
+            zf.write(self.photo, "a.jpg")
+            zf.write(self.photo, "b.jpg")
+            offset = zf.getinfo("a.jpg").header_offset + 30 + len("a.jpg") + 2000
+        data = bytearray(damaged.read_bytes())
+        data[offset] ^= 0xff
+        damaged.write_bytes(data)
+        output = self.work / "damaged.pdf"
+        self.run_script("--no-ocr", "-o", output, damaged, expect=1)
+        result = self.run_script("--no-ocr", "-k", "-j", 2, "-o", output, damaged, expect=2)
+        self.assertIn("damaged.zip!a.jpg", result.stderr)
+        self.assertEqual(page_count(output), 1)
+
+    def test_keep_going_stops_when_nothing_or_a_limit_remains(self):
+        junk = self.work / "junk.zip"
+        junk.write_bytes(b"not a zip at all")
+        output = self.work / "out.pdf"
+        for jobs in (1, 2):
+            result = self.run_script("--no-ocr", "-k", "-j", jobs, "-o", output, junk, expect=1)
+            self.assertIn("Hiçbir sayfa", result.stderr)
+        archive = self.work / "pages.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.write(self.photo, "a.jpg")
+            zf.write(self.photo, "b.jpg")
+        result = self.run_script("--no-ocr", "-k", "--zip-max-files", 1, "-o", output, archive, expect=1)
+        self.assertIn("--zip-max-files", result.stderr)
+        self.assertFalse(output.exists())
+
     def test_output_name_defaults_to_the_single_input(self):
         result = self.run_script("--no-ocr", self.photo)
         self.assertIn("photo.pdf", result.stdout)

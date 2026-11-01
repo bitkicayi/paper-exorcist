@@ -15,6 +15,7 @@ import collections
 import concurrent.futures
 import contextlib
 import csv
+import gc
 import io
 import math
 import multiprocessing
@@ -28,7 +29,7 @@ import tempfile
 import warnings
 import zipfile
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 IMAGE_FORMATS = {
     ".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP",
     ".bmp": "BMP", ".tif": "TIFF", ".tiff": "TIFF",
@@ -38,6 +39,10 @@ HEIF_SUFFIXES = {".heic", ".heif"}
 PAGE_SUFFIXES = set(IMAGE_FORMATS) | HEIF_SUFFIXES
 # Exit status when --keep-going skipped pages but still produced a PDF.
 EXIT_PARTIAL = 2
+
+
+class ArchiveLimitError(ValueError):
+    """A safety limit, not a damaged file: --keep-going must not walk past it."""
 
 
 def load_dependencies():
@@ -140,6 +145,8 @@ def arguments():
         parser.error("--margin-mm 0 ile 50 arasında olmalı.")
     if args.strict and (args.crop or args.no_auto_crop):
         parser.error("--strict yalnızca otomatik kırpma ile kullanılabilir.")
+    if args.strict and args.keep_going:
+        parser.error("--strict ilk sorunda durur, --keep-going devam eder; birlikte kullanılamaz.")
     if args.zip_max_mb < 1 or args.zip_max_files < 1:
         parser.error("--zip-max-mb ve --zip-max-files en az 1 olmalı.")
     if not 1 <= args.jpeg_quality <= 100:
@@ -187,6 +194,11 @@ def collect_inputs(inputs, recursive):
     return files
 
 
+def skip_page(label, reason, args, prefix=""):
+    print(f"{prefix}Atlandı: {label}: {reason}", file=sys.stderr)
+    args.skipped.append(label)
+
+
 def expand_archives(files, directory, args):
     pages = []
     total_size, total_files = 0, 0
@@ -209,29 +221,43 @@ def expand_archives(files, directory, args):
                 if not members:
                     raise ValueError("Arşivde desteklenen resim bulunamadı.")
                 if total_files + len(members) > args.zip_max_files:
-                    raise ValueError("ZIP resim sayısı sınırı aşıldı; --zip-max-files ile artırabilirsiniz.")
+                    raise ArchiveLimitError("ZIP resim sayısı sınırı aşıldı; --zip-max-files ile artırabilirsiniz.")
                 if total_size + sum(info.file_size for info in members) > limit:
-                    raise ValueError("Açılmış ZIP boyutu sınırı aşıldı; --zip-max-mb ile artırabilirsiniz.")
+                    raise ArchiveLimitError("Açılmış ZIP boyutu sınırı aşıldı; --zip-max-mb ile artırabilirsiniz.")
                 for info in members:
-                    if info.flag_bits & 1:
-                        raise ValueError(f"Şifreli ZIP resmi desteklenmiyor: {info.filename}")
                     total_files += 1
                     suffix = Path(info.filename.replace("\\", "/")).suffix.lower()
                     # Never use archive paths on disk: even ../ or absolute member
                     # names become generated flat filenames inside a private temp dir.
                     destination = directory / f"{total_files:06d}{suffix}"
-                    with archive.open(info) as source, destination.open("xb") as target:
-                        while True:
-                            chunk = source.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            total_size += len(chunk)
-                            if total_size > limit:
-                                raise ValueError("Açılmış ZIP boyutu sınırı aşıldı (--zip-max-mb).")
-                            target.write(chunk)
-                    pages.append((destination, f"{path}!{info.filename}"))
-        except Exception as exc:
+                    label = f"{path}!{info.filename}"
+                    try:
+                        if info.flag_bits & 1:
+                            raise ValueError("Şifreli ZIP resmi desteklenmiyor.")
+                        with archive.open(info) as source, destination.open("xb") as target:
+                            while True:
+                                chunk = source.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                total_size += len(chunk)
+                                if total_size > limit:
+                                    raise ArchiveLimitError("Açılmış ZIP boyutu sınırı aşıldı (--zip-max-mb).")
+                                target.write(chunk)
+                    except ArchiveLimitError:
+                        raise
+                    except Exception as exc:
+                        if not args.keep_going:
+                            raise ValueError(f"{info.filename}: {exc}") from exc
+                        destination.unlink(missing_ok=True)
+                        skip_page(label, exc, args)
+                        continue
+                    pages.append((destination, label))
+        except ArchiveLimitError as exc:
             raise ValueError(f"ZIP açılamadı: {path}: {exc}") from exc
+        except Exception as exc:
+            if not args.keep_going:
+                raise ValueError(f"ZIP açılamadı: {path}: {exc}") from exc
+            skip_page(str(path), exc, args)
     return pages
 
 
@@ -841,7 +867,7 @@ def worker_init():
 
 def rendered_pages(pages, args):
     """Yield (page, result or exception) in input order, rendering ahead in parallel."""
-    if args.jobs == 1 or len(pages) == 1:
+    if args.jobs == 1 or len(pages) <= 1:
         for index, (path, label) in enumerate(pages):
             try:
                 yield (path, label), render_page(index, path, label, args)
@@ -855,10 +881,10 @@ def rendered_pages(pages, args):
     try:
         queue = collections.deque()
         upcoming = iter(enumerate(pages))
-        # A bounded window keeps memory flat for archives with thousands of photos.
+        # Finished pages wait here as raw pixels, so keep the window just past the workers.
         for index, (path, label) in upcoming:
             queue.append(((path, label), pool.submit(render_page, index, path, label, args)))
-            if len(queue) >= args.jobs * 2:
+            if len(queue) > args.jobs:
                 break
         while queue:
             page, future = queue.popleft()
@@ -903,6 +929,7 @@ def create_pdf(args):
     if args.debug_dir:
         args.debug_dir = str(Path(args.debug_dir).expanduser().absolute())
         Path(args.debug_dir).mkdir(parents=True, exist_ok=True)
+    args.skipped = []
     with tempfile.TemporaryDirectory(prefix="paper-exorcist-zip-") as directory:
         pages = expand_archives(files, Path(directory), args)
         if args.heif_convert is None and any(p.suffix.lower() in HEIF_SUFFIXES for p, _ in pages):
@@ -921,7 +948,7 @@ def write_pdf(pages, output, args):
     # FAT/exFAT and some network mounts refuse chmod; the mount decides there.
     with contextlib.suppress(OSError):
         os.chmod(temporary, 0o666 & ~umask)
-    skipped = []
+    drawn = 0
     try:
         pdf = canvas.Canvas(temporary, pagesize=A4, pageCompression=1)
         pdf.setTitle(output.stem)
@@ -934,8 +961,7 @@ def write_pdf(pages, output, args):
                 if isinstance(outcome, Exception):
                     if not args.keep_going:
                         raise ValueError(f"İşlenemedi: {label}: {outcome}")
-                    print(f"{prefix} Atlandı: {label}: {outcome}", file=sys.stderr)
-                    skipped.append(label)
+                    skip_page(label, outcome, args, f"{prefix} ")
                     continue
                 image, words, layout, source_format, messages = outcome
                 print(f"{prefix} {label}: {messages[0]}", file=sys.stderr)
@@ -943,7 +969,10 @@ def write_pdf(pages, output, args):
                     print(f"    {message}", file=sys.stderr)
                 with image:
                     draw_page(pdf, image, words, layout, source_format, args)
-        if len(skipped) == total:
+                drawn += 1
+                # ReportLab's readers sit in reference cycles, each holding a page's raw pixels.
+                gc.collect()
+        if not drawn:
             raise ValueError("Hiçbir sayfa işlenemedi; PDF oluşturulmadı.")
         pdf.save()
         if args.force:
@@ -961,9 +990,9 @@ def write_pdf(pages, output, args):
                 except FileExistsError as exc:
                     raise ValueError(f"Çıktı işlem sırasında oluşturuldu: {output}") from exc
                 os.replace(temporary, output)
-        print(f"Hazır: {output} ({total - len(skipped)} sayfa)")
-        if skipped:
-            print(f"Uyarı: {len(skipped)} sayfa atlandı: {', '.join(skipped)}", file=sys.stderr)
+        print(f"Hazır: {output} ({drawn} sayfa)")
+        if args.skipped:
+            print(f"Uyarı: {len(args.skipped)} öğe atlandı: {', '.join(args.skipped)}", file=sys.stderr)
             return EXIT_PARTIAL
         return 0
     finally:

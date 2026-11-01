@@ -2,6 +2,14 @@
 
 the rectangle's medical history.
 
+## 1.4.2
+
+- fixed: raw pixels of finished pages piled up in memory. a long zip no longer needs a bigger laptop.
+- fewer finished pages wait in line during parallel runs.
+- `--keep-going` now survives damaged zips and damaged zip members too. safety limits still stop the run.
+- `--strict` and `--keep-going` can no longer be combined: one stops, the other doesn't. pick a personality.
+- `.gitignore` now knows about heic and about phones that shout `IMG_0001.JPG`.
+
 ## 1.4.1
 
 - `-o` is optional for a single input: `photo.jpg` becomes `photo.pdf` right here.

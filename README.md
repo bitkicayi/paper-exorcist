@@ -100,7 +100,7 @@ invisible, selectable text follows the recognized lines so copying a sentence do
 
 **iphone photo refused.** it's heic. `sudo apt install libheif-examples` and try again. portrait-mode depth maps are ignored; they were never part of the document.
 
-**one bad photo killed the whole zip.** `--keep-going` skips it, finishes the pdf and exits with `2` so scripts can tell.
+**one bad photo killed the whole zip.** `--keep-going` skips it, including damaged zips and damaged files inside them, finishes the pdf and exits with `2` so scripts can tell. a mistyped path or a `--zip-max-*` limit still stops the run, and `--strict` refuses to share a command with it.
 
 **it's slow.** ocr is most of the time. `--jobs` uses more cores, `--no-ocr` skips the reading entirely.
 
