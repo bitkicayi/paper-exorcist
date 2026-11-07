@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Nautilus script: select photos, right-click, Scripts → Exorcise to PDF.
+# Installed twice by `make install-nautilus`; the "(scan)" copy also evicts shadows.
+set -uo pipefail
+
+exorcist="${PAPER_EXORCIST:-$(command -v paper-exorcist || echo "$HOME/.local/bin/paper-exorcist")}"
+log="${XDG_CACHE_HOME:-$HOME/.cache}/paper-exorcist/last-run.log"
+mkdir -p "$(dirname "$log")"
+
+tell() {
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send --app-name=paper-exorcist --icon=x-office-document "paper-exorcist" "$1"
+    fi
+}
+
+complain() {
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --error --no-markup --title="paper-exorcist" --width=480 --text="$1"
+    else
+        tell "$1"
+    fi
+}
+
+# Nautilus gives absolute paths here (also in search results); "$@" is the fallback.
+inputs=()
+if [ -n "${NAUTILUS_SCRIPT_SELECTED_FILE_PATHS:-}" ]; then
+    while IFS= read -r path; do
+        [ -n "$path" ] && inputs+=("$path")
+    done <<<"$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS"
+else
+    inputs=("$@")
+fi
+if [ "${#inputs[@]}" -eq 0 ]; then
+    complain "önce fotoğraf, zip ya da klasör seçin. boşluğu pdf'e çeviremiyorum; denedim."
+    exit 1
+fi
+if [ ! -x "$exorcist" ]; then
+    complain "paper-exorcist bulunamadı. repoda 'make install' çalıştırın."
+    exit 1
+fi
+
+options=(--keep-going --rotate auto)
+case "$(basename -- "$0")" in
+    *scan*) options+=(--mode scan) ;;
+esac
+
+# One input names the pdf after itself; several get a timestamp. Never overwrite.
+directory="$(cd -- "$(dirname -- "${inputs[0]}")" && pwd)"
+if [ "${#inputs[@]}" -eq 1 ]; then
+    name="$(basename -- "${inputs[0]}")"
+    [ -d "${inputs[0]}" ] || name="${name%.*}"
+else
+    name="exorcised-$(date +%Y%m%d-%H%M%S)"
+fi
+output="$directory/$name.pdf"
+number=2
+while [ -e "$output" ]; do
+    output="$directory/$name ($number).pdf"
+    number=$((number + 1))
+done
+
+"$exorcist" "${options[@]}" -o "$output" -- "${inputs[@]}" >"$log" 2>&1 &
+pid=$!
+
+# Feed zenity from the log's [n/total] lines. A failed write means the window
+# was closed, and a closed window means "stop".
+progress() {
+    local step="" last=""
+    while kill -0 "$pid" 2>/dev/null; do
+        step="$(grep -o '^\[[0-9]*/[0-9]*\]' "$log" | tail -n 1)"
+        if [ -n "$step" ] && [ "$step" != "$last" ]; then
+            last="$step"
+            step="${step#[}"
+            step="${step%]}"
+            printf '%s\n' "$((${step%/*} * 99 / ${step#*/}))" || return
+        fi
+        printf '# %s\n' "${last:-[başlıyor]} gölgeler tahliye ediliyor..." || return
+        sleep 0.3
+    done
+    printf '100\n'
+}
+
+if command -v zenity >/dev/null 2>&1; then
+    progress | zenity --progress --title="paper-exorcist" --text="kağıt okunuyor..." \
+        --percentage=0 --auto-close --width=420
+fi
+if kill -0 "$pid" 2>/dev/null && command -v zenity >/dev/null 2>&1; then
+    kill -TERM "$pid"
+fi
+wait "$pid"
+status=$?
+
+case "$status" in
+    0) tell "$(basename -- "$output") hazır. gölgeler tahliye edildi." ;;
+    2) tell "$(basename -- "$output") hazır, ama bazı sayfalar direndi. ayrıntılar: $log" ;;
+    130 | 143) tell "iptal edildi. kağıt hâlâ perili." ;;
+    *) complain "$(tail -n 8 "$log")"$'\n\n'"tam kayıt: $log" ;;
+esac
+exit "$status"

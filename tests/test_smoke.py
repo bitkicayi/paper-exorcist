@@ -76,6 +76,72 @@ class PaperExorcistTest(unittest.TestCase):
         self.assertIn("--force", result.stderr)
         self.run_script("--no-ocr", "-f", "-o", output, self.photo)
 
+    def nautilus(self, *selected, script="Exorcise to PDF", zenity_progress="cat >/dev/null"):
+        """Run the right-click script with stand-ins for zenity and notify-send."""
+        tools = self.work / "desktop-bin"
+        calls = self.work / "calls.log"
+        if not tools.exists():
+            tools.mkdir()
+            (tools / "paper-exorcist").symlink_to(SCRIPT)
+            (tools / "notify-send").write_text(f'#!/bin/sh\necho "notify $*" >> "{calls}"\n')
+        (tools / "zenity").write_text(textwrap.dedent(f"""\
+            #!/bin/sh
+            echo "zenity $*" >> "{calls}"
+            case "$*" in *--progress*) {zenity_progress} ;; esac
+        """))
+        for tool in tools.iterdir():
+            if not tool.is_symlink():
+                tool.chmod(0o755)
+        runner = self.work / script
+        if not runner.exists():
+            shutil.copy(SCRIPT.parent / "nautilus" / "exorcise-to-pdf", runner)
+        env = dict(os.environ, PATH=f"{tools}:{os.environ['PATH']}", XDG_CACHE_HOME=str(self.work / "cache"),
+                   NAUTILUS_SCRIPT_SELECTED_FILE_PATHS="".join(f"{path}\n" for path in selected))
+        result = subprocess.run(["/bin/bash", str(runner)], capture_output=True, text=True, env=env, cwd="/")
+        return result, calls.read_text() if calls.exists() else ""
+
+    def test_nautilus_names_the_pdf_and_never_overwrites(self):
+        photos = self.work / "photos"
+        photos.mkdir()
+        shutil.copy(self.photo, photos / "receipt.jpg")
+        for expected in ("receipt.pdf", "receipt (2).pdf"):
+            result, calls = self.nautilus(photos / "receipt.jpg")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(page_count(photos / expected), 1)
+            self.assertIn(f"paper-exorcist {expected} hazır", calls)
+        self.assertIn("zenity --progress", calls)
+        result, _ = self.nautilus(photos / "receipt.jpg", self.photo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(page_count(next(photos.glob("exorcised-*.pdf"))), 2)
+
+    def test_nautilus_scan_variant_makes_grayscale_pages(self):
+        result, _ = self.nautilus(self.photo, script="Exorcise to PDF (scan)")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        listing = subprocess.run(["pdfimages", "-list", str(self.fixtures / "photo.pdf")],
+                                 capture_output=True, text=True, check=True).stdout
+        (self.fixtures / "photo.pdf").unlink()
+        self.assertIn(" gray ", listing)
+
+    def test_nautilus_closing_the_progress_bar_cancels_cleanly(self):
+        for number in range(8):
+            shutil.copy(self.photo, self.work / f"page{number}.jpg")
+        pages = sorted(self.work.glob("page*.jpg"))
+        # Close the window once pages are being processed, not during startup.
+        result, calls = self.nautilus(*pages, zenity_progress="sleep 2.5; exit 1")
+        log = (self.work / "cache/paper-exorcist/last-run.log").read_text()
+        self.assertEqual(result.returncode, 130, log)
+        self.assertIn("İşlem iptal edildi", log)
+        self.assertIn("iptal edildi", calls)
+        self.assertEqual(list(self.work.glob("*.pdf")) + list(self.work.glob(".paper-exorcist-*")), [])
+
+    def test_nautilus_shows_errors_in_a_dialog(self):
+        broken = self.work / "broken.jpg"
+        broken.write_bytes(b"not a jpeg")
+        result, calls = self.nautilus(broken)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("zenity --error", calls)
+        self.assertIn("broken.jpg", calls)
+
     def test_strict_and_keep_going_cannot_be_combined(self):
         result = self.run_script("--no-ocr", "--strict", "-k", "-o", self.work / "out.pdf", self.photo, expect=2)
         self.assertIn("--strict", result.stderr)

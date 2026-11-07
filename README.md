@@ -25,6 +25,19 @@ make install
 `make install` puts it in `~/.local/bin`. if your terminal still forgets the command, add `$HOME/.local/bin` to its `PATH`.
 `make uninstall` sends it back. you can also skip installation and run `bash paper-exorcist.sh` with the same options.
 
+## or don't open a terminal at all
+
+```bash
+make install-nautilus
+```
+
+select photos, a zip or a folder in Files, right-click, **Scripts → Exorcise to PDF**.
+the **(scan)** one also evicts the shadows. a progress bar keeps you company, a notification tells you when it's over.
+
+the pdf lands next to what you picked: one photo is named after itself, several get a timestamp, and nothing gets overwritten.
+it turns sideways pages upright and skips the cursed ones. if things go badly, the error and the full log (`~/.cache/paper-exorcist/last-run.log`) come to you.
+closing the progress bar cancels the ritual cleanly. no half-born pdfs.
+
 ## feed it rectangles
 
 ```bash

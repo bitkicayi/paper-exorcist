@@ -23,13 +23,14 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import warnings
 import zipfile
 
-VERSION = "1.4.2"
+VERSION = "1.5.0"
 IMAGE_FORMATS = {
     ".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP",
     ".bmp": "BMP", ".tif": "TIFF", ".tiff": "TIFF",
@@ -1002,7 +1003,13 @@ def write_pdf(pages, output, args):
             pass
 
 
+def interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 def main():
+    # A closed progress window or a plain `kill` cleans up exactly like Ctrl-C.
+    signal.signal(signal.SIGTERM, interrupt)
     args = arguments()
     try:
         load_dependencies()

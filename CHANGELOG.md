@@ -2,6 +2,11 @@
 
 the rectangle's medical history.
 
+## 1.5.0
+
+- right-click exorcism: `make install-nautilus` adds *Exorcise to PDF* and *Exorcise to PDF (scan)* to the Files scripts menu, with a progress bar and a notification at the end.
+- closing that progress bar, or a plain `kill`, cleans up like Ctrl-C instead of leaving a half-born pdf behind.
+
 ## 1.4.2
 
 - fixed: raw pixels of finished pages piled up in memory. a long zip no longer needs a bigger laptop.
