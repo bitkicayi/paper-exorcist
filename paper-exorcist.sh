@@ -30,7 +30,7 @@ import tempfile
 import warnings
 import zipfile
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 IMAGE_FORMATS = {
     ".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP",
     ".bmp": "BMP", ".tif": "TIFF", ".tiff": "TIFF",
@@ -57,12 +57,15 @@ def load_dependencies():
         from reportlab.lib.pagesizes import A4, LETTER
         from reportlab.pdfbase import pdfmetrics
         from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab import rl_config
     except ImportError as exc:
         raise ValueError(
             f"Eksik Python bağımlılığı: {exc}.\n"
             "Kurulum: sudo apt install python3-opencv python3-pil python3-reportlab\n"
             "Özel Python ortamı kullanıyorsanız PAPER_EXORCIST_PYTHON değişkenini kontrol edin."
         ) from exc
+    # ASCII85 turns image streams into text and makes every page ~25% larger.
+    rl_config.useA85 = 0
 
 
 def crop_argument(value):
@@ -282,9 +285,13 @@ def read_rgb(path, label=None):
             # accesses a closed TIFF stream on Ubuntu 22.04's Pillow 9.0.1.
             if not is_tiff:
                 source = ImageOps.exif_transpose(source)
-            source = source.convert("RGBA")
-            background = Image.new("RGBA", source.size, (255, 255, 255, 255))
-            rgb_image = Image.alpha_composite(background, source).convert("RGB")
+            if source.mode in ("RGBA", "LA", "PA") or "transparency" in source.info:
+                source = source.convert("RGBA")
+                background = Image.new("RGBA", source.size, (255, 255, 255, 255))
+                rgb_image = Image.alpha_composite(background, source).convert("RGB")
+            else:
+                # Photos rarely have alpha; compositing them only costs time.
+                rgb_image = source.convert("RGB")
             # Avoid Pillow 9's obsolete __array__ protocol with NumPy 2, which
             # users may have installed alongside the Ubuntu system packages.
             return np.frombuffer(rgb_image.tobytes(), dtype=np.uint8).reshape(
@@ -561,8 +568,8 @@ def detect_rotation(rgb, args):
         gray = cv2.resize(gray, (max(2, round(gray.shape[1] * scale)), max(2, round(gray.shape[0] * scale))),
                           interpolation=cv2.INTER_AREA)
     with tempfile.TemporaryDirectory(prefix="paper-exorcist-osd-") as directory:
-        path = Path(directory) / "page.png"
-        Image.fromarray(gray).save(path, format="PNG")
+        path = Path(directory) / "page.pnm"
+        Image.fromarray(gray).save(path, format="PPM")
         try:
             result = subprocess.run([args.tesseract, str(path), "stdout", "--psm", "0", "--dpi", "300"],
                                     capture_output=True, text=True, encoding="utf-8",
@@ -722,7 +729,9 @@ def recognize_words(image, args, effective_dpi):
     if min(size) < 10:
         return []
     with tempfile.TemporaryDirectory(prefix="paper-exorcist-ocr-") as directory:
-        path = Path(directory) / "page.png"
+        # Uncompressed: Tesseract reads it right back, and PNG encoding took
+        # about as long as recognition itself.
+        path = Path(directory) / "page.pnm"
         # Recognition must not depend on the chosen visible PDF color mode.
         # Clean shadows before upscaling, just as --mode scan does for the image.
         recognition = image
@@ -730,10 +739,10 @@ def recognize_words(image, args, effective_dpi):
             recognition = Image.fromarray(scan_image(np.asarray(image.convert("RGB"))))
         try:
             if size == recognition.size:
-                recognition.save(path, format="PNG")
+                recognition.save(path, format="PPM")
             else:
                 with recognition.resize(size, getattr(Image, "Resampling", Image).LANCZOS) as enlarged:
-                    enlarged.save(path, format="PNG")
+                    enlarged.save(path, format="PPM")
         finally:
             if recognition is not image:
                 recognition.close()

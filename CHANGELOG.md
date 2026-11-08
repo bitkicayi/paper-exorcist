@@ -2,6 +2,13 @@
 
 the rectangle's medical history.
 
+## 1.5.1
+
+- about 30% faster with ocr: tesseract now gets an uncompressed image instead of waiting for a png nobody keeps.
+- pdfs are about 20% smaller: image streams are no longer translated into ascii85 for no reason.
+- photos without transparency skip the transparency ritual.
+- same text, same pixels. checked in every mode.
+
 ## 1.5.0
 
 - right-click exorcism: `make install-nautilus` adds *Exorcise to PDF* and *Exorcise to PDF (scan)* to the Files scripts menu, with a progress bar and a notification at the end.

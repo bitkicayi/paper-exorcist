@@ -57,6 +57,18 @@ class PaperExorcistTest(unittest.TestCase):
         self.assertIn("perspektif düzeltildi", result.stderr)
         self.assertIn("haunted rectangle", page_text(self.work / "out.pdf"))
         self.assertEqual(stat.S_IMODE((self.work / "out.pdf").stat().st_mode), 0o644)
+        # ASCII85 would make every image stream ~25% larger for nothing.
+        self.assertNotIn(b"/ASCII85Decode", (self.work / "out.pdf").read_bytes())
+
+    def test_transparent_pixels_become_white_paper(self):
+        from PIL import Image
+        transparent = self.work / "transparent.png"
+        Image.new("RGBA", (300, 400), (0, 0, 0, 0)).save(transparent)
+        output = self.work / "out.pdf"
+        self.run_script("--no-ocr", "--no-auto-crop", "--paper", "image", "--margin-mm", 0, "-o", output, transparent)
+        subprocess.run(["pdftoppm", "-r", "30", "-png", "-singlefile", str(output), str(self.work / "page")], check=True)
+        # Transparent black must come out as paper, not as a black hole.
+        self.assertGreater(min(Image.open(self.work / "page.png").convert("RGB").getpixel((10, 10))), 240)
 
     def test_zip_keeps_natural_order_in_parallel(self):
         archive = self.work / "pages.zip"
